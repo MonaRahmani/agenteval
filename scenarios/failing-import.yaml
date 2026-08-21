@@ -1,0 +1,195 @@
+name: failing-import
+description: >-
+  A small inventory package whose history starts healthy and later acquires a
+  circular import between inventory.models and inventory.report, so that
+  `import inventory` fails with a partially-initialized-module ImportError.
+
+seeded_bug: >-
+  Commit 3 adds report.py, which imports models.py — fine on its own. Commit 4
+  then rewrites Item.summary() to reuse report.format_currency instead of its
+  own inline formatting, adding a module-scope `from inventory.report import
+  format_currency` to models.py. models.py and report.py now import each other,
+  so importing the package raises "ImportError: cannot import name 'Item' from
+  partially initialized module 'inventory.models' (most likely due to a
+  circular import)". Commits 0-2 import and test cleanly.
+
+rubric: rubrics/failing-import.yaml
+
+files:
+  - path: README.md
+    description: Package overview and usage example.
+  - path: inventory/__init__.py
+    description: Public surface; re-exports Item and Store.
+  - path: inventory/models.py
+    description: The Item dataclass. Rewritten by the final commit to introduce the cycle.
+  - path: inventory/store.py
+    description: In-memory SKU-keyed collection of Items.
+  - path: inventory/report.py
+    description: Currency formatting and stock listings. Imports models, which later imports it back.
+  - path: tests/test_store.py
+    description: Unit tests for Store totals and duplicate-SKU rejection.
+
+commits:
+  - message: "Add inventory package with Item model and Store"
+    author_date: 2026-01-05T09:14:00Z
+    files:
+      - path: README.md
+        content: |
+          # inventory
+
+          A tiny stock-tracking package.
+
+          ```python
+          from inventory import Item, Store
+
+          store = Store()
+          store.add(Item(sku="ABC-1", name="Widget", quantity=4, unit_price=2.50))
+          print(store.total_value())
+          ```
+
+      - path: inventory/__init__.py
+        content: |
+          from inventory.models import Item
+          from inventory.store import Store
+
+          __all__ = ["Item", "Store"]
+
+      - path: inventory/models.py
+        content: |
+          from dataclasses import dataclass
+
+
+          @dataclass
+          class Item:
+              sku: str
+              name: str
+              quantity: int
+              unit_price: float
+
+              @property
+              def total_value(self) -> float:
+                  return self.quantity * self.unit_price
+
+              def summary(self) -> str:
+                  return f"{self.sku} {self.name} x{self.quantity} (${self.total_value:,.2f})"
+
+      - path: inventory/store.py
+        content: |
+          from inventory.models import Item
+
+
+          class Store:
+              def __init__(self) -> None:
+                  self._items: dict[str, Item] = {}
+
+              def add(self, item: Item) -> None:
+                  if item.sku in self._items:
+                      raise KeyError(f"duplicate sku: {item.sku}")
+                  self._items[item.sku] = item
+
+              def get(self, sku: str) -> Item:
+                  return self._items[sku]
+
+              def items(self) -> list[Item]:
+                  return sorted(self._items.values(), key=lambda item: item.sku)
+
+              def total_value(self) -> float:
+                  return sum(item.total_value for item in self._items.values())
+
+  - message: "Add tests covering Store totals and duplicate SKUs"
+    author_date: 2026-01-06T14:02:00Z
+    files:
+      - path: tests/test_store.py
+        content: |
+          import pytest
+
+          from inventory import Item, Store
+
+
+          def make_store() -> Store:
+              store = Store()
+              store.add(Item(sku="ABC-1", name="Widget", quantity=4, unit_price=2.50))
+              store.add(Item(sku="XYZ-9", name="Gadget", quantity=2, unit_price=10.00))
+              return store
+
+
+          def test_total_value() -> None:
+              assert make_store().total_value() == pytest.approx(30.00)
+
+
+          def test_duplicate_sku_rejected() -> None:
+              store = make_store()
+              with pytest.raises(KeyError):
+                  store.add(Item(sku="ABC-1", name="Widget", quantity=1, unit_price=2.50))
+
+
+          def test_summary_includes_formatted_price() -> None:
+              item = make_store().get("XYZ-9")
+              assert "$20.00" in item.summary()
+
+  - message: "Add report module for formatted stock listings"
+    author_date: 2026-01-08T11:37:00Z
+    files:
+      - path: inventory/report.py
+        content: |
+          from inventory.models import Item
+          from inventory.store import Store
+
+
+          def format_currency(amount: float) -> str:
+              return f"${amount:,.2f}"
+
+
+          def line(item: Item) -> str:
+              return (
+                  f"{item.sku:<10} {item.name:<20} {item.quantity:>4}  "
+                  f"{format_currency(item.total_value)}"
+              )
+
+
+          def stock_report(store: Store) -> str:
+              rows = [line(item) for item in store.items()]
+              rows.append(f"{'TOTAL':<36}{format_currency(store.total_value())}")
+              return "\n".join(rows)
+
+      - path: README.md
+        content: |
+          # inventory
+
+          A tiny stock-tracking package.
+
+          ```python
+          from inventory import Item, Store
+          from inventory.report import stock_report
+
+          store = Store()
+          store.add(Item(sku="ABC-1", name="Widget", quantity=4, unit_price=2.50))
+          print(stock_report(store))
+          ```
+
+  - message: "Reuse report.format_currency in Item.summary"
+    author_date: 2026-01-12T16:55:00Z
+    files:
+      - path: inventory/models.py
+        content: |
+          from dataclasses import dataclass
+
+          from inventory.report import format_currency
+
+
+          @dataclass
+          class Item:
+              sku: str
+              name: str
+              quantity: int
+              unit_price: float
+
+              @property
+              def total_value(self) -> float:
+                  return self.quantity * self.unit_price
+
+              def summary(self) -> str:
+                  return (
+                      f"{self.sku} {self.name} x{self.quantity} "
+                      f"({format_currency(self.total_value)})"
+                  )
