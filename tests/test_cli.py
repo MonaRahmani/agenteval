@@ -184,10 +184,58 @@ def test_seed_dry_run_prints_url_and_one_sha_per_commit(fake_github: MagicMock) 
         assert message in result.output
 
 
-def test_seed_without_token_exits_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_seed_dry_run_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Previewing a seed must not require credentials."""
     monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
 
     result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    text = output(result)
+    assert result.exit_code == 0, text
+    assert "error:" not in text
+    assert "No GitHub token available" not in text
+    # The unauthenticated notice is informational, not a failure.
+    assert "unauthenticated" in text.lower()
+
+
+def test_seed_dry_run_without_token_prints_planned_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    text = output(result)
+
+    assert result.exit_code == 0, text
+    for message in (
+        "Add inventory package with Item model and Store",
+        "Add tests covering Store totals and duplicate SKUs",
+        "Add report module for formatted stock listings",
+        "Reuse report.format_currency in Item.summary",
+    ):
+        assert message in text, f"missing planned commit: {message}"
+
+
+def test_seed_dry_run_without_token_never_constructs_a_github(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    github_cls = MagicMock(name="Github")
+    monkeypatch.setattr(gc, "Github", github_cls)
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    assert result.exit_code == 0, output(result)
+    github_cls.assert_not_called()
+
+
+def test_seed_without_dry_run_and_no_token_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real path still demands credentials."""
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO)])
 
     assert result.exit_code != 0
     assert TOKEN_ENV_VAR in output(result)

@@ -41,6 +41,7 @@ DESCRIPTION_PREFIX = "[agenteval]"
 DEFAULT_BRANCH = "main"
 DEFAULT_AUTHOR_NAME = "agenteval"
 DEFAULT_AUTHOR_EMAIL = "agenteval@users.noreply.github.com"
+UNAUTHENTICATED_LOGIN = "dry-run-user"
 
 _BLOB_MODE = "100644"
 
@@ -88,31 +89,74 @@ class GitHubClient:
 
     def __init__(self, token: str | None = None, dry_run: bool = False) -> None:
         resolved = token if token is not None else os.environ.get(TOKEN_ENV_VAR)
-        if not resolved:
+
+        self.dry_run = dry_run
+        self._token: str | None = resolved or None
+        self._github: Github | None = None
+        self._login: str | None = None
+
+        if resolved:
+            self._github = Github(auth=Auth.Token(resolved))
+            return
+
+        if not dry_run:
             raise GitHubClientError(
                 f"No GitHub token available. Pass token=... or set the {TOKEN_ENV_VAR} "
                 f"environment variable to a personal access token with 'repo' scope."
             )
 
-        self.dry_run = dry_run
-        self._token = resolved
-        self._github = Github(auth=Auth.Token(resolved))
-        self._login: str | None = None
+        # Dry run with no credentials: previewing a seed should not require a
+        # token. Nothing is written, and reads are synthesized rather than made.
+        self._login = UNAUTHENTICATED_LOGIN
+        logger.info(
+            "[dry-run] no %s set; running unauthenticated — no API calls will be made",
+            TOKEN_ENV_VAR,
+        )
 
     # -- identity ----------------------------------------------------------
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether this client can actually reach the API."""
+        return self._github is not None
+
+    def _require_github(self) -> Github:
+        if self._github is None:
+            raise GitHubClientError(
+                f"This operation requires authentication. Set {TOKEN_ENV_VAR} or pass token=..."
+            )
+        return self._github
+
+    def _stub_repo(self, name: str, description: str) -> Repository:
+        """A stand-in Repository for dry runs that cannot or should not fetch."""
+        return cast(
+            Repository,
+            _DryRunRepository(
+                name=name,
+                full_name=f"{self.login}/{name}",
+                description=description,
+                html_url=f"https://github.com/{self.login}/{name}",
+            ),
+        )
 
     @property
     def login(self) -> str:
         """Login of the authenticated user, fetched once and cached."""
         if self._login is None:
+            github = self._require_github()
             with _api("resolving the authenticated user"):
-                self._login = self._github.get_user().login
+                self._login = github.get_user().login
         return self._login
 
     # -- reads -------------------------------------------------------------
 
     def repo_exists(self, name: str) -> bool:
         """Whether the authenticated user already owns a repo called `name`."""
+        if self._github is None:
+            logger.info(
+                "[dry-run] assuming repo %r does not exist (no credentials to check with)", name
+            )
+            return False
         try:
             self._github.get_user().get_repo(name)
         except UnknownObjectException:
@@ -125,6 +169,9 @@ class GitHubClient:
 
     def get_repo(self, name: str) -> Repository:
         """Fetch a repo owned by the authenticated user."""
+        if self._github is None:
+            logger.info("[dry-run] synthesizing repo %r (no credentials to fetch it with)", name)
+            return self._stub_repo(name, f"{DESCRIPTION_PREFIX} <unknown, not fetched>")
         try:
             return self._github.get_user().get_repo(name)
         except UnknownObjectException as exc:
@@ -154,18 +201,11 @@ class GitHubClient:
 
         if self.dry_run:
             logger.info("[dry-run] would create repo %r with topic %r", name, MANAGED_TOPIC)
-            return cast(
-                Repository,
-                _DryRunRepository(
-                    name=name,
-                    full_name=f"{self.login}/{name}",
-                    description=marked_description,
-                    html_url=f"https://github.com/{self.login}/{name}",
-                ),
-            )
+            return self._stub_repo(name, marked_description)
 
+        github = self._require_github()
         with _api(f"creating repo {name!r}"):
-            repo = self._github.get_user().create_repo(
+            repo = github.get_user().create_repo(
                 name=name,
                 description=marked_description,
                 private=True,
@@ -277,6 +317,13 @@ class GitHubClient:
             )
 
         if self.dry_run:
+            if not self.authenticated:
+                logger.warning(
+                    "[dry-run] could not verify the %r marker on %r without credentials; "
+                    "a real run would check it before deleting",
+                    MANAGED_TOPIC,
+                    name,
+                )
             logger.info("[dry-run] would delete repo %r", name)
             return
 

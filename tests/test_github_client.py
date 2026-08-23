@@ -10,6 +10,7 @@ from agenteval.github_client import (
     DESCRIPTION_PREFIX,
     MANAGED_TOPIC,
     TOKEN_ENV_VAR,
+    UNAUTHENTICATED_LOGIN,
     GitHubClient,
     GitHubClientError,
 )
@@ -469,3 +470,105 @@ def test_no_test_here_touches_the_network(fake_github: MagicMock) -> None:
     """The Github class itself is a mock, so no transport is ever constructed."""
     make_client(fake_github)
     assert isinstance(getattr(gc, "Github"), MagicMock)  # noqa: B009
+
+
+# --- unauthenticated dry run -----------------------------------------------
+
+
+def test_dry_run_client_constructs_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Previewing a seed must not require credentials."""
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    client = GitHubClient(dry_run=True)
+
+    assert client.dry_run is True
+    assert client.authenticated is False
+
+
+def test_dry_run_without_token_never_constructs_a_github(
+    monkeypatch: pytest.MonkeyPatch, fake_github: MagicMock
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    GitHubClient(dry_run=True)
+
+    cast(MagicMock, getattr(gc, "Github")).assert_not_called()  # noqa: B009
+
+
+def test_dry_run_without_token_synthesizes_a_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    assert GitHubClient(dry_run=True).login == UNAUTHENTICATED_LOGIN
+
+
+def test_dry_run_without_token_assumes_repo_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    assert GitHubClient(dry_run=True).repo_exists("anything") is False
+
+
+def test_dry_run_without_token_can_create_a_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    repo = GitHubClient(dry_run=True).create_repo("failing-import", "A scenario.")
+
+    assert repo.name == "failing-import"
+    assert repo.full_name == f"{UNAUTHENTICATED_LOGIN}/failing-import"
+    assert repo.description == f"{DESCRIPTION_PREFIX} A scenario."
+
+
+def test_dry_run_without_token_can_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    client = GitHubClient(dry_run=True)
+    repo = client.create_repo("failing-import", "A scenario.")
+
+    sha = client.create_commit(repo, "Add files", {"a.py": "x\n"}, None, AUTHOR_DATE)
+
+    assert len(sha) == 40
+
+
+def test_dry_run_without_token_can_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    GitHubClient(dry_run=True).delete_repo("failing-import")  # must not raise
+
+
+def test_dry_run_without_token_warns_it_cannot_verify_the_marker(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    with caplog.at_level("WARNING", logger="agenteval.github_client"):
+        GitHubClient(dry_run=True).delete_repo("failing-import")
+
+    assert "could not verify" in caplog.text
+    assert MANAGED_TOPIC in caplog.text
+
+
+def test_non_dry_run_still_requires_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unauthenticated path must not leak into real runs."""
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    with pytest.raises(GitHubClientError, match=TOKEN_ENV_VAR):
+        GitHubClient(dry_run=False)
+
+    with pytest.raises(GitHubClientError, match=TOKEN_ENV_VAR):
+        GitHubClient()
+
+
+def test_authenticated_dry_run_still_checks_the_real_marker(fake_github: MagicMock) -> None:
+    """With a token, dry-run reads are real — the guard is not weakened."""
+    repo = fake_github.get_user.return_value.get_repo.return_value
+    repo.get_topics.return_value = ["production"]
+
+    client = GitHubClient(token="t0ken", dry_run=True)
+    assert client.authenticated is True
+
+    with pytest.raises(GitHubClientError, match="Refusing to delete"):
+        client.delete_repo("real-work")
+
+
+def test_authenticated_client_reports_authenticated(fake_github: MagicMock) -> None:
+    assert GitHubClient(token="t0ken").authenticated is True
