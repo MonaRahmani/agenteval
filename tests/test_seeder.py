@@ -443,9 +443,7 @@ def test_reset_on_missing_repo_exits_cleanly(client: MagicMock) -> None:
     client.delete_repo.assert_not_called()
 
 
-def test_reset_on_missing_repo_says_so(
-    client: MagicMock, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_reset_on_missing_repo_says_so(client: MagicMock, caplog: pytest.LogCaptureFixture) -> None:
     client.repo_exists.return_value = False
 
     with caplog.at_level("INFO", logger="agenteval.seeder"):
