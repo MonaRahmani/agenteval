@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format
+        run: ruff format --check .
+
+      - name: Typecheck
+        run: mypy src
+
+      - name: Test
+        run: pytest --cov=agenteval --cov-report=term-missing --cov-fail-under=85
+
+      # Proves the CLI works end to end with no credentials at all. A dry run
+      # writes nothing, so it must not need a token.
+      - name: CLI smoke test (no credentials)
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          agenteval seed scenarios/failing-import.yaml --dry-run
+          echo "seed --dry-run exited $?"
+
+  determinism:
+    name: determinism
+    runs-on: ubuntu-latest
+    # The core guarantee of this tool: the same scenario always produces the
+    # same commit SHAs. It gets its own job so a regression is unmissable
+    # rather than one dot in the test output.
+    env:
+      GITHUB_TOKEN: ""
+      PYTHONHASHSEED: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Recompute every scenario's SHAs and compare runs
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          from agenteval.scenario import load_scenario
+          from agenteval.seeder import verify_deterministic
+
+          paths = sorted(
+              p for p in Path("scenarios").iterdir() if p.suffix in {".yaml", ".yml"}
+          )
+          if not paths:
+              sys.exit("no scenarios found under scenarios/")
+
+          # A third run in a fresh interpreter under a different hash seed, so a
+          # dependency on dict/set iteration order cannot hide inside one process.
+          ONE_LINER = (
+              "import json,sys;"
+              "from pathlib import Path;"
+              "from agenteval.scenario import load_scenario;"
+              "from agenteval.seeder import verify_deterministic;"
+              "print(json.dumps(verify_deterministic(load_scenario(Path(sys.argv[1])))))"
+          )
+
+          failed = False
+
+          for path in paths:
+              first = verify_deterministic(load_scenario(path))
+              second = verify_deterministic(load_scenario(path))
+              third = json.loads(
+                  subprocess.run(
+                      [sys.executable, "-c", ONE_LINER, str(path)],
+                      capture_output=True,
+                      text=True,
+                      check=True,
+                      env={**os.environ, "PYTHONHASHSEED": "1"},
+                  ).stdout
+              )
+
+              runs = {
+                  "run 1 (in-process)": first,
+                  "run 2 (in-process)": second,
+                  "run 3 (subprocess, PYTHONHASHSEED=1)": third,
+              }
+
+              if first == second == third:
+                  print(f"OK    {path}  {len(first)} commits  head={first[-1]}")
+                  continue
+
+              failed = True
+              print(f"FAIL  {path}: commit SHAs are NOT deterministic")
+              for label, shas in runs.items():
+                  print(f"  {label}:")
+                  for index, sha in enumerate(shas):
+                      print(f"    commit {index}: {sha}")
+              for index in range(max(len(v) for v in runs.values())):
+                  values = {label: (shas[index:index + 1] or ["<missing>"])[0]
+                            for label, shas in runs.items()}
+                  if len(set(values.values())) > 1:
+                      print(f"  >> commit {index} differs:")
+                      for label, sha in values.items():
+                          print(f"       {label}: {sha}")
+
+          if failed:
+              sys.exit("determinism check failed — see the differing SHAs above")
+
+          print(f"\nall {len(paths)} scenario(s) deterministic across 3 runs")
+          PY
+
+  validate-scenarios:
+    name: validate-scenarios
+    runs-on: ubuntu-latest
+    # Catches a shipped scenario drifting out of sync with the schema.
+    env:
+      GITHUB_TOKEN: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Validate every scenario
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(scenarios/*.yaml scenarios/*.yml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no scenarios found under scenarios/"
+            exit 1
+          fi
+
+          status=0
+          for file in "${files[@]}"; do
+            echo "::group::$file"
+            if ! agenteval validate "$file"; then
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "$status" -ne 0 ]; then
+            echo "one or more scenarios failed validation"
+          fi
+          exit "$status"
