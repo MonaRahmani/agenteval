@@ -460,3 +460,145 @@ def test_reset_propagates_a_refused_deletion(client: MagicMock) -> None:
 
     with pytest.raises(GitHubClientError, match="Refusing to delete"):
         reset("real-work", client)
+
+
+# --- auto-init commit must not survive into the history --------------------
+
+
+def test_seed_force_updates_the_ref_to_the_final_commit(client: MagicMock) -> None:
+    scenario = build_scenario()
+
+    result = seed(scenario, client)
+
+    client.update_ref.assert_called_once()
+    repo_arg, sha_arg = client.update_ref.call_args.args
+    assert repo_arg is client.create_repo.return_value
+    assert sha_arg == result.commit_shas[-1] == "sha2"
+
+
+def test_ref_is_updated_after_every_commit(client: MagicMock) -> None:
+    """Moving the branch early would leave the later commits unreferenced."""
+    order: list[str] = []
+    counter = iter(f"sha{i}" for i in range(100))
+
+    def record_commit(*args: Any, **kwargs: Any) -> str:
+        order.append("commit")
+        return next(counter)
+
+    def record_ref(*args: Any, **kwargs: Any) -> None:
+        order.append("ref")
+
+    client.create_commit.side_effect = record_commit
+    client.update_ref.side_effect = record_ref
+
+    seed(build_scenario(), client)
+
+    assert order == ["commit", "commit", "commit", "ref"]
+
+
+def test_seed_never_parents_the_first_commit_on_auto_init(client: MagicMock) -> None:
+    """The scenario's first commit is a root commit; auto-init is not its parent."""
+    seed(build_scenario(), client)
+
+    assert commit_calls(client)[0].args[3] is None
+
+
+def test_ref_update_failure_is_reported_clearly(client: MagicMock) -> None:
+    client.update_ref.side_effect = GitHubClientError("422 cannot force")
+
+    with pytest.raises(GitHubClientError, match="could not move the default branch"):
+        seed(build_scenario(), client)
+
+
+def test_seeded_history_excludes_the_auto_init_commit(tmp_path: Path) -> None:
+    """Replay the real GitHub sequence with git itself and inspect `git log`.
+
+    Mirrors production exactly: an auto-init commit exists first, the scenario's
+    commits are written as objects with the first having no parent, then the
+    branch is force-moved onto the last one.
+    """
+    if not HAS_GIT:
+        pytest.skip("git not available")
+
+    scenario = build_scenario()
+    work = tmp_path / "repo"
+    work.mkdir()
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": DEFAULT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": DEFAULT_AUTHOR_EMAIL,
+        "GIT_COMMITTER_NAME": DEFAULT_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": DEFAULT_AUTHOR_EMAIL,
+    }
+
+    def git(*args: str, **extra: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**env, **extra},
+        ).stdout.strip()
+
+    # 1. What auto_init=True produces: a repo with exactly one commit.
+    git("init", "-q", "-b", "main")
+    (work / "README.md").write_text("# auto-init\n")
+    git("add", "README.md")
+    git(
+        "commit",
+        "-q",
+        "-m",
+        "Initial commit",
+        GIT_AUTHOR_DATE="2020-01-01T00:00:00+0000",
+        GIT_COMMITTER_DATE="2020-01-01T00:00:00+0000",
+    )
+    auto_init_sha = git("rev-parse", "HEAD")
+    assert git("log", "--format=%H") == auto_init_sha
+    (work / "README.md").unlink()  # the scenario does not contain the auto-init file
+
+    # 2. Write the scenario's commits as objects. The first has NO parent.
+    parent: str | None = None
+    shas: list[str] = []
+    for index, commit in enumerate(scenario.commits):
+        for path, content in scenario.content_at(index).items():
+            target = work / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        git("read-tree", "--empty")  # scenario trees, not auto-init's
+        git("add", "-A")
+        tree = git("write-tree")
+        stamp = commit.author_date.strftime("%Y-%m-%dT%H:%M:%S+0000")
+        parent_args = ["-p", parent] if parent else []
+        sha = git(
+            "commit-tree",
+            tree,
+            *parent_args,
+            "-m",
+            commit.message,
+            GIT_AUTHOR_DATE=stamp,
+            GIT_COMMITTER_DATE=stamp,
+        )
+        shas.append(sha)
+        parent = sha
+
+    # 3. Force the branch onto the last scenario commit, orphaning auto-init.
+    git("update-ref", "refs/heads/main", shas[-1])
+
+    log = git("log", "--format=%H %s").splitlines()
+
+    assert [line.split(" ", 1)[1] for line in log] == [
+        c.message for c in reversed(scenario.commits)
+    ]
+    assert auto_init_sha not in git("log", "--format=%H")
+    assert "Initial commit" not in git("log", "--format=%s")
+    assert len(log) == len(scenario.commits)
+
+    # The root commit really is parentless.
+    assert git("rev-list", "--max-parents=0", "HEAD") == shas[0]
+
+    # And the resulting SHAs are exactly what verify_deterministic predicted.
+    assert shas == verify_deterministic(scenario)

@@ -185,8 +185,6 @@ def test_create_commit_uses_git_data_api_in_order(fake_github: MagicMock) -> Non
         "get_git_commit",
         "create_git_tree",
         "create_git_commit",
-        "get_git_ref",
-        "get_git_ref",  # the .edit() call on the returned ref
     ]
 
 
@@ -275,7 +273,8 @@ def test_create_commit_converts_offset_dates_to_utc(fake_github: MagicMock) -> N
 # --- create_commit: initial vs subsequent ----------------------------------
 
 
-def test_initial_commit_has_no_parents_and_creates_the_ref(fake_github: MagicMock) -> None:
+def test_initial_commit_has_no_parents(fake_github: MagicMock) -> None:
+    """The first scenario commit is a root commit, not a child of auto-init."""
     repo = make_repo()
 
     make_client(fake_github).create_commit(
@@ -284,7 +283,17 @@ def test_initial_commit_has_no_parents_and_creates_the_ref(fake_github: MagicMoc
 
     assert repo.create_git_commit.call_args.kwargs["parents"] == []
     repo.get_git_commit.assert_not_called()
-    repo.create_git_ref.assert_called_once_with("refs/heads/main", "commit1")
+
+
+def test_create_commit_touches_no_refs(fake_github: MagicMock) -> None:
+    """Refs move once, at the end, via update_ref — never per commit."""
+    repo = make_repo()
+
+    make_client(fake_github).create_commit(
+        repo, "Initial", {"a.py": "x = 1\n"}, parent_sha=None, author_date=AUTHOR_DATE
+    )
+
+    repo.create_git_ref.assert_not_called()
     repo.get_git_ref.assert_not_called()
 
 
@@ -294,7 +303,7 @@ def test_initial_commit_tree_has_no_base_tree(fake_github: MagicMock) -> None:
     assert len(repo.create_git_tree.call_args.args) == 1
 
 
-def test_subsequent_commit_uses_parent_and_updates_the_ref(fake_github: MagicMock) -> None:
+def test_subsequent_commit_uses_the_parent(fake_github: MagicMock) -> None:
     repo = make_repo()
 
     make_client(fake_github).create_commit(
@@ -305,17 +314,14 @@ def test_subsequent_commit_uses_parent_and_updates_the_ref(fake_github: MagicMoc
     parent = repo.get_git_commit.return_value
     assert repo.create_git_commit.call_args.kwargs["parents"] == [parent]
     assert repo.create_git_tree.call_args.args[1] is parent.tree
-    repo.get_git_ref.assert_called_once_with("heads/main")
-    repo.get_git_ref.return_value.edit.assert_called_once_with("commit1")
+    repo.get_git_ref.assert_not_called()
     repo.create_git_ref.assert_not_called()
 
 
-def test_commit_targets_a_custom_branch(fake_github: MagicMock) -> None:
+def test_update_ref_targets_a_custom_branch(fake_github: MagicMock) -> None:
     repo = make_repo()
-    make_client(fake_github).create_commit(
-        repo, "Initial", {"a.py": "x\n"}, None, AUTHOR_DATE, branch="trunk"
-    )
-    repo.create_git_ref.assert_called_once_with("refs/heads/trunk", "commit1")
+    make_client(fake_github).update_ref(repo, "commit1", branch="trunk")
+    repo.get_git_ref.assert_called_once_with("heads/trunk")
 
 
 def test_empty_file_map_is_refused(fake_github: MagicMock) -> None:
@@ -334,7 +340,6 @@ def test_empty_file_map_is_refused(fake_github: MagicMock) -> None:
         ("create_git_blob", "creating blob"),
         ("create_git_tree", "creating tree"),
         ("create_git_commit", "creating commit"),
-        ("create_git_ref", "creating ref"),
     ],
 )
 def test_api_failure_mid_sequence_surfaces_as_client_error(
@@ -572,3 +577,143 @@ def test_authenticated_dry_run_still_checks_the_real_marker(fake_github: MagicMo
 
 def test_authenticated_client_reports_authenticated(fake_github: MagicMock) -> None:
     assert GitHubClient(token="t0ken").authenticated is True
+
+
+# --- empty-repo 409 and the auto_init fix ----------------------------------
+
+
+class EmptyRepoError(GithubException):
+    """The real 409 GitHub returns for Git Data writes into a commitless repo."""
+
+    def __init__(self) -> None:
+        super().__init__(409, {"message": "Git Repository is empty."}, None)
+
+
+def stateful_fake_repo(has_commits: bool) -> MagicMock:
+    """A repo that enforces GitHub's real rule: no blobs before a first commit."""
+    repo = MagicMock(name="StatefulRepo")
+    repo.has_commits = has_commits
+    repo.default_branch = "main"
+    blobs = iter(f"blob{i}" for i in range(100))
+
+    def blob(content: str, encoding: str) -> MagicMock:
+        if not repo.has_commits:
+            raise EmptyRepoError()
+        return MagicMock(sha=next(blobs))
+
+    repo.create_git_blob.side_effect = blob
+    repo.create_git_tree.return_value = MagicMock(sha="tree1")
+    repo.create_git_commit.return_value = MagicMock(sha="commit1")
+    return repo
+
+
+def wire_repo_creation(fake_github: MagicMock) -> MagicMock:
+    """Make create_repo honour auto_init the way GitHub does."""
+    user = fake_github.get_user.return_value
+    user.get_repo.side_effect = UnknownObjectException(404, "nope", {})
+
+    def create_repo(**kwargs: object) -> MagicMock:
+        return stateful_fake_repo(has_commits=bool(kwargs.get("auto_init")))
+
+    user.create_repo.side_effect = create_repo
+    return cast(MagicMock, user)
+
+
+def test_create_repo_passes_auto_init_true(fake_github: MagicMock) -> None:
+    """Without auto_init the Git Data API rejects the very first blob."""
+    user = wire_repo_creation(fake_github)
+
+    make_client(fake_github).create_repo("failing-import", "desc")
+
+    assert user.create_repo.call_args.kwargs["auto_init"] is True
+
+
+def test_the_fake_reproduces_the_409_when_auto_init_is_false(fake_github: MagicMock) -> None:
+    """Guard on the guard: the fixture really does model the reported bug."""
+    repo = stateful_fake_repo(has_commits=False)
+
+    with pytest.raises(GitHubClientError, match="Git Repository is empty"):
+        make_client(fake_github).create_commit(repo, "m", {"a.py": "x\n"}, None, AUTHOR_DATE)
+
+
+def test_happy_path_no_longer_hits_the_empty_repo_error(fake_github: MagicMock) -> None:
+    """End to end through create_repo: the 409 can no longer occur."""
+    wire_repo_creation(fake_github)
+    client = make_client(fake_github)
+
+    repo = client.create_repo("failing-import", "desc")
+    sha = client.create_commit(repo, "Initial", {"a.py": "x\n"}, None, AUTHOR_DATE)
+
+    assert sha == "commit1"
+    assert cast(MagicMock, repo).has_commits is True
+
+
+# --- update_ref ------------------------------------------------------------
+
+
+def test_update_ref_forces_by_default(fake_github: MagicMock) -> None:
+    repo = make_repo()
+    repo.default_branch = "main"
+
+    make_client(fake_github).update_ref(repo, "finalsha")
+
+    repo.get_git_ref.assert_called_once_with("heads/main")
+    repo.get_git_ref.return_value.edit.assert_called_once_with("finalsha", force=True)
+
+
+def test_update_ref_uses_the_repos_default_branch(fake_github: MagicMock) -> None:
+    repo = make_repo()
+    repo.default_branch = "master"
+
+    make_client(fake_github).update_ref(repo, "finalsha")
+
+    repo.get_git_ref.assert_called_once_with("heads/master")
+
+
+def test_update_ref_wraps_api_errors(fake_github: MagicMock) -> None:
+    repo = make_repo()
+    repo.default_branch = "main"
+    repo.get_git_ref.side_effect = GithubException(422, "cannot force", {})
+
+    with pytest.raises(GitHubClientError, match="force-updating ref"):
+        make_client(fake_github).update_ref(repo, "finalsha")
+
+
+def test_dry_run_update_ref_performs_no_write(fake_github: MagicMock) -> None:
+    repo = make_repo()
+    repo.default_branch = "main"
+
+    make_client(fake_github, dry_run=True).update_ref(repo, "finalsha")
+
+    repo.get_git_ref.assert_not_called()
+
+
+# --- 403 fine-grained token hint -------------------------------------------
+
+
+def test_403_on_repo_creation_explains_fine_grained_tokens(fake_github: MagicMock) -> None:
+    user = fake_github.get_user.return_value
+    user.get_repo.side_effect = UnknownObjectException(404, "nope", {})
+    user.create_repo.side_effect = GithubException(
+        403, {"message": "Resource not accessible by personal access token"}, None
+    )
+
+    with pytest.raises(GitHubClientError) as excinfo:
+        make_client(fake_github).create_repo("failing-import", "desc")
+
+    message = str(excinfo.value)
+    assert "Fine-grained" in message
+    assert "classic" in message
+    assert "delete_repo" in message
+    assert TOKEN_ENV_VAR in message
+
+
+def test_non_403_repo_creation_error_keeps_the_generic_message(fake_github: MagicMock) -> None:
+    user = fake_github.get_user.return_value
+    user.get_repo.side_effect = UnknownObjectException(404, "nope", {})
+    user.create_repo.side_effect = GithubException(500, "server exploded", {})
+
+    with pytest.raises(GitHubClientError, match="GitHub API error while creating repo") as excinfo:
+        make_client(fake_github).create_repo("failing-import", "desc")
+
+    assert "Fine-grained" not in str(excinfo.value)

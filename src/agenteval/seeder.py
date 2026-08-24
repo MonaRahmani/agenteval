@@ -8,6 +8,11 @@ The two invariants worth stating up front:
 * **Reproducible SHAs.** `verify_deterministic` recomputes the expected commit
   SHAs locally using git's own object hashing, so the determinism property can
   be asserted in CI without a token or a network.
+* **No auto-init commit.** Repos are created with auto_init=True because the Git
+  Data API rejects blobs in an empty repo, but the seeded history must not
+  contain that commit. The first scenario commit is a root commit (no parent),
+  and the branch is force-moved onto the last scenario commit at the end, which
+  orphans the auto-init commit.
 """
 
 from __future__ import annotations
@@ -185,6 +190,18 @@ def seed(scenario: Scenario, client: GitHubClient) -> SeedResult:
         logger.info("commit %d/%d %s %s", index + 1, len(scenario.commits), sha[:7], commit.message)
         shas.append(sha)
         parent_sha = sha
+
+    # The repo was created with auto_init=True so the Git Data API would accept
+    # blobs. That auto-init commit is NOT part of the scenario, and the first
+    # scenario commit is a root commit rather than its child. Forcing the branch
+    # onto the last scenario commit orphans it, leaving exactly this history.
+    try:
+        client.update_ref(repo, shas[-1])
+    except GitHubClientError as exc:
+        raise GitHubClientError(
+            f"Seeding {scenario.name!r} committed every scenario commit but could not "
+            f"move the default branch to {shas[-1]}: {exc}"
+        ) from exc
 
     return SeedResult(
         repo_name=scenario.name,

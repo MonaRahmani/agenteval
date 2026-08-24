@@ -59,6 +59,18 @@ def _api(description: str) -> Iterator[None]:
         raise GitHubClientError(f"GitHub API error while {description}: {exc}") from exc
 
 
+def _repo_creation_error(name: str, exc: GithubException) -> GitHubClientError:
+    """Turn a repo-creation failure into something the user can act on."""
+    if exc.status == 403:
+        return GitHubClientError(
+            f"GitHub refused to create repo {name!r} (403: {exc.data}). Fine-grained "
+            f"personal access tokens cannot create repositories. Create a *classic* "
+            f"token with the 'repo' and 'delete_repo' scopes and set {TOKEN_ENV_VAR} "
+            f"to it."
+        )
+    return GitHubClientError(f"GitHub API error while creating repo {name!r}: {exc}")
+
+
 def _git_timestamp(value: datetime) -> str:
     """Format a datetime the way the Git Data API expects, pinned to UTC."""
     aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
@@ -204,13 +216,18 @@ class GitHubClient:
             return self._stub_repo(name, marked_description)
 
         github = self._require_github()
-        with _api(f"creating repo {name!r}"):
+        try:
+            # auto_init=True is required, not cosmetic: the Git Data API refuses
+            # to create blobs in a repo with zero commits ("409 Git Repository is
+            # empty"). The auto-init commit is orphaned later by update_ref.
             repo = github.get_user().create_repo(
                 name=name,
                 description=marked_description,
                 private=True,
-                auto_init=False,
+                auto_init=True,
             )
+        except GithubException as exc:
+            raise _repo_creation_error(name, exc) from exc
 
         with _api(f"tagging repo {name!r} as managed"):
             repo.replace_topics([MANAGED_TOPIC])
@@ -286,16 +303,38 @@ class GitHubClient:
                 committer=identity,
             )
 
-        ref_name = f"refs/heads/{branch}"
-        if parent_sha is None:
-            with _api(f"creating ref {ref_name}"):
-                repo.create_git_ref(ref_name, commit.sha)
-        else:
-            with _api(f"updating ref {ref_name}"):
-                repo.get_git_ref(f"heads/{branch}").edit(commit.sha)
-
+        # Deliberately no ref update here. Commits are written as loose objects
+        # and the branch is moved once, at the end, by update_ref — that is what
+        # orphans the auto-init commit instead of building on top of it.
         logger.info("committed %s (%s)", commit.sha, message)
         return commit.sha
+
+    def update_ref(
+        self,
+        repo: Repository,
+        sha: str,
+        branch: str | None = None,
+        force: bool = True,
+    ) -> None:
+        """Point `branch` at `sha`, discarding whatever it pointed at before.
+
+        The force is the point: the branch starts on the repo's auto-init commit,
+        and the seeded history is a *different* root. A fast-forward update would
+        be rejected; forcing leaves the auto-init commit unreferenced.
+
+        Args:
+            branch: defaults to the repo's own default branch.
+        """
+        target = branch or str(getattr(repo, "default_branch", DEFAULT_BRANCH) or DEFAULT_BRANCH)
+
+        if self.dry_run:
+            logger.info("[dry-run] would force %s to %s", target, sha)
+            return
+
+        with _api(f"force-updating ref heads/{target} to {sha}"):
+            repo.get_git_ref(f"heads/{target}").edit(sha, force=force)
+
+        logger.info("branch %s now points at %s", target, sha)
 
     def delete_repo(self, name: str) -> None:
         """Delete a repo, but only if this tool created it.
