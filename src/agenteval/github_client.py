@@ -198,22 +198,36 @@ class GitHubClient:
     def create_repo(self, name: str, description: str) -> Repository:
         """Create a marked repo under the authenticated user.
 
+        A dry run reports an existing repo but does not abort on it: a preview
+        writes nothing, so the state of the remote cannot make it unsafe. Only a
+        live run refuses.
+
         Raises:
-            GitHubClientError: a repo of that name already exists. The caller
-                should reset rather than seed on top of unknown content.
+            GitHubClientError: a repo of that name already exists and this is not
+                a dry run. The caller should reset rather than seed on top of
+                unknown content.
         """
-        if self.repo_exists(name):
+        exists = self.repo_exists(name)
+        marked_description = f"{DESCRIPTION_PREFIX} {description}"
+
+        if self.dry_run:
+            if exists:
+                logger.warning(
+                    "[dry-run] repo %r already exists under %r — a live run would refuse "
+                    "until you run `agenteval reset %s`",
+                    name,
+                    self.login,
+                    name,
+                )
+            logger.info("[dry-run] would create repo %r with topic %r", name, MANAGED_TOPIC)
+            return self._stub_repo(name, marked_description)
+
+        if exists:
             raise GitHubClientError(
                 f"Repo {name!r} already exists under {self.login!r}. Run "
                 f"`agenteval reset {name}` to delete it first — refusing to seed "
                 f"into an existing repository."
             )
-
-        marked_description = f"{DESCRIPTION_PREFIX} {description}"
-
-        if self.dry_run:
-            logger.info("[dry-run] would create repo %r with topic %r", name, MANAGED_TOPIC)
-            return self._stub_repo(name, marked_description)
 
         github = self._require_github()
         try:
@@ -261,8 +275,12 @@ class GitHubClient:
         Returns:
             The SHA of the new commit.
         """
+        # Messages carry a trailing newline for git's object format; that is a
+        # storage detail and must never reach human-facing output.
+        display = message.strip()
+
         if not files:
-            raise GitHubClientError(f"Refusing to create empty commit {message!r}: no files given")
+            raise GitHubClientError(f"Refusing to create empty commit {display!r}: no files given")
 
         timestamp = _git_timestamp(author_date)
         identity = InputGitAuthor(author_name, author_email, timestamp)
@@ -274,7 +292,7 @@ class GitHubClient:
             sha = expected_sha or self._stub_sha(message, files, parent_sha, timestamp)
             logger.info(
                 "[dry-run] would commit %r (%d file(s)) onto %s as %s",
-                message,
+                display,
                 len(files),
                 parent_sha or "<no parent>",
                 sha,
@@ -312,7 +330,7 @@ class GitHubClient:
         # Deliberately no ref update here. Commits are written as loose objects
         # and the branch is moved once, at the end, by update_ref — that is what
         # orphans the auto-init commit instead of building on top of it.
-        logger.info("committed %s (%s)", commit.sha, message)
+        logger.info("committed %s (%s)", commit.sha, display)
         return commit.sha
 
     def update_ref(

@@ -27,12 +27,19 @@ R = TypeVar("R")
 
 
 def _configure_logging() -> None:
-    """Send progress to stdout; errors go to stderr via typer.secho."""
+    """Send progress to stdout; errors go to stderr via typer.secho.
+
+    The handler is rebuilt on every invocation rather than installed once. A
+    StreamHandler captures `sys.stdout` by value, so a cached handler would keep
+    writing to the stream of the *first* invocation — which breaks any process
+    that runs the CLI more than once.
+    """
     root = logging.getLogger("agenteval")
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        root.addHandler(handler)
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(handler)
     root.setLevel(logging.INFO)
 
 
@@ -110,11 +117,21 @@ def seed(
     result = seed_scenario(scenario, client)
 
     typer.echo("")
-    typer.secho(f"seeded {result.repo_name}", fg=typer.colors.GREEN)
-    typer.echo(f"  url: {result.repo_url}")
-    typer.echo("  commits:")
+    if dry_run:
+        # Nothing exists yet, so do not report a result or a live URL. The
+        # predicted SHAs below are the point of the preview.
+        typer.secho(
+            f"predicted history for {result.repo_name} (dry run: nothing was written)",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo("  commits a live run would create:")
+    else:
+        typer.secho(f"seeded {result.repo_name}", fg=typer.colors.GREEN)
+        typer.echo(f"  url: {result.repo_url}")
+        typer.echo("  commits:")
+
     for sha, commit in zip(result.commit_shas, scenario.commits, strict=True):
-        typer.echo(f"    {sha}  {commit.message}")
+        typer.echo(f"    {sha}  {commit.message.strip()}")
 
 
 @app.command()

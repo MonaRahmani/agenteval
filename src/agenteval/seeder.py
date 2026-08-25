@@ -195,7 +195,16 @@ def seed(scenario: Scenario, client: GitHubClient) -> SeedResult:
                 f"{len(scenario.commits)} ({commit.message!r}): {exc}"
             ) from exc
 
-        logger.info("commit %d/%d %s %s", index + 1, len(scenario.commits), sha[:7], commit.message)
+        if not client.dry_run:
+            # In dry-run the client already logs a richer line for each commit
+            # (parent SHA and file count); a second one is just noise.
+            logger.info(
+                "commit %d/%d %s %s",
+                index + 1,
+                len(scenario.commits),
+                sha[:7],
+                commit.message.strip(),
+            )
         shas.append(sha)
         parent_sha = sha
 
