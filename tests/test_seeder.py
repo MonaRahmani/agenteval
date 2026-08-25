@@ -79,6 +79,9 @@ def client() -> MagicMock:
     counter = iter(f"sha{i}" for i in range(100))
     mock.create_commit.side_effect = lambda *a, **k: next(counter)
     mock.repo_exists.return_value = True
+    # Explicit: a bare MagicMock attribute is truthy, which would silently send
+    # these tests down the dry-run branch.
+    mock.dry_run = False
     return mock
 
 
@@ -600,3 +603,69 @@ def test_seeded_history_excludes_the_auto_init_commit(tmp_path: Path) -> None:
 
     # And the resulting SHAs are exactly what verify_deterministic predicted.
     assert shas == verify_deterministic(scenario)
+
+
+# --- dry run reports the SHAs a live run would produce ---------------------
+
+
+@pytest.fixture
+def dry_client() -> MagicMock:
+    """A client in dry-run mode that echoes back the caller's expected_sha."""
+    mock = MagicMock(name="GitHubClient(dry_run=True)")
+    mock.dry_run = True
+    mock.create_repo.return_value = MagicMock(html_url="https://github.com/dry-run-user/x")
+    mock.repo_exists.return_value = False
+
+    def echo(*args: Any, **kwargs: Any) -> str:
+        expected = kwargs.get("expected_sha")
+        assert expected is not None, "seed() must pass expected_sha in dry-run mode"
+        return str(expected)
+
+    mock.create_commit.side_effect = echo
+    return mock
+
+
+def test_dry_run_seed_reports_verify_deterministic_shas(dry_client: MagicMock) -> None:
+    scenario = load_scenario(SHIPPED_SCENARIO)
+
+    result = seed(scenario, dry_client)
+
+    assert result.commit_shas == verify_deterministic(scenario)
+
+
+def test_dry_run_seed_passes_predicted_sha_to_each_commit(dry_client: MagicMock) -> None:
+    scenario = build_scenario()
+    expected = verify_deterministic(scenario)
+
+    seed(scenario, dry_client)
+
+    passed = [call.kwargs["expected_sha"] for call in dry_client.create_commit.call_args_list]
+    assert passed == expected
+
+
+def test_dry_run_parents_chain_through_predicted_shas(dry_client: MagicMock) -> None:
+    """Parent SHAs in the preview must be predicted ones, not placeholders."""
+    scenario = build_scenario()
+    expected = verify_deterministic(scenario)
+
+    seed(scenario, dry_client)
+
+    parents = [call.args[3] for call in dry_client.create_commit.call_args_list]
+    assert parents == [None, *expected[:-1]]
+
+
+def test_dry_run_moves_the_ref_to_the_predicted_head(dry_client: MagicMock) -> None:
+    scenario = build_scenario()
+
+    seed(scenario, dry_client)
+
+    _, sha = dry_client.update_ref.call_args.args
+    assert sha == verify_deterministic(scenario)[-1]
+
+
+def test_live_seed_does_not_precompute_shas(client: MagicMock) -> None:
+    """Only dry runs predict; a live run reports what GitHub actually returned."""
+    seed(build_scenario(), client)
+
+    for call in client.create_commit.call_args_list:
+        assert call.kwargs["expected_sha"] is None

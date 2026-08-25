@@ -1,4 +1,5 @@
 import contextlib
+import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
@@ -310,3 +311,78 @@ def test_reset_refuses_unmarked_repo(fake_github: MagicMock) -> None:
     assert "Refusing to delete" in output(result)
     assert "Traceback" not in output(result)
     repo.delete.assert_not_called()
+
+
+# --- dry-run and validate must agree on SHAs -------------------------------
+
+
+def shas_from_seed_output(text: str) -> list[str]:
+    """Full SHAs in first-seen order, as `seed` prints them."""
+    return list(dict.fromkeys(re.findall(r"\b[0-9a-f]{40}\b", text)))
+
+
+def prefixes_from_validate_output(text: str) -> list[str]:
+    return re.findall(r"^ {4}([0-9a-f]{10})  ", text, re.M)
+
+
+def test_dry_run_seed_and_validate_print_identical_shas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preview that disagrees with the prediction would undermine the whole tool."""
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    seeded = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    validated = runner.invoke(app, ["validate", str(SHIPPED_SCENARIO)])
+
+    assert seeded.exit_code == 0, output(seeded)
+    assert validated.exit_code == 0, output(validated)
+
+    seed_shas = shas_from_seed_output(output(seeded))
+    validate_prefixes = prefixes_from_validate_output(output(validated))
+
+    assert len(validate_prefixes) == 4
+    assert [sha[:10] for sha in seed_shas] == validate_prefixes
+
+
+def test_dry_run_seed_shas_match_verify_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenteval.scenario import load_scenario
+    from agenteval.seeder import verify_deterministic
+
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    expected = verify_deterministic(load_scenario(SHIPPED_SCENARIO))
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    assert shas_from_seed_output(output(result)) == expected
+
+
+def test_dry_run_output_contains_no_placeholder_shas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every 40-hex string printed must be a real predicted SHA."""
+    from agenteval.scenario import load_scenario
+    from agenteval.seeder import verify_deterministic
+
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    predicted = set(verify_deterministic(load_scenario(SHIPPED_SCENARIO)))
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    printed = set(re.findall(r"\b[0-9a-f]{40}\b", output(result)))
+
+    assert printed, "no SHAs printed at all"
+    assert printed - predicted == set(), "placeholder SHAs leaked into dry-run output"
+
+
+def test_dry_run_is_stable_across_invocations(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    first = shas_from_seed_output(
+        output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+    )
+    second = shas_from_seed_output(
+        output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+    )
+
+    assert first == second
