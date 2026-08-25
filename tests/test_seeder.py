@@ -669,3 +669,38 @@ def test_live_seed_does_not_precompute_shas(client: MagicMock) -> None:
 
     for call in client.create_commit.call_args_list:
         assert call.kwargs["expected_sha"] is None
+
+
+# --- progress logging: one line per commit, not two ------------------------
+
+
+def test_live_seed_logs_a_progress_line_per_commit(
+    client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("INFO", logger="agenteval.seeder"):
+        seed(build_scenario(), client)
+
+    progress = [line for line in caplog.text.splitlines() if "commit " in line]
+    assert len(progress) == 3
+    assert "commit 1/3" in caplog.text
+
+
+def test_dry_run_seed_logs_no_progress_line(
+    dry_client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The client already logs a richer line; a second would duplicate it."""
+    with caplog.at_level("INFO", logger="agenteval.seeder"):
+        seed(build_scenario(), dry_client)
+
+    assert "commit 1/3" not in caplog.text
+
+
+def test_progress_line_strips_the_message(
+    client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("INFO", logger="agenteval.seeder"):
+        seed(build_scenario(), client)
+
+    for line in caplog.text.splitlines():
+        assert line == line.rstrip()
+    assert "\\n" not in caplog.text

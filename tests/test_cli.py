@@ -177,12 +177,19 @@ def test_seed_dry_run_says_it_is_a_dry_run(fake_github: MagicMock) -> None:
     assert "dry run" in result.output.lower()
 
 
-def test_seed_dry_run_prints_url_and_one_sha_per_commit(fake_github: MagicMock) -> None:
+def test_seed_dry_run_prints_one_sha_per_commit(fake_github: MagicMock) -> None:
     result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
 
-    assert "https://github.com/octocat/failing-import" in result.output
     for message in ("Add inventory package", "Reuse report.format_currency"):
         assert message in result.output
+
+
+def test_seed_dry_run_does_not_print_a_live_url(fake_github: MagicMock) -> None:
+    """Nothing was created, so no URL should be presented as if it existed."""
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    assert "https://github.com/octocat/failing-import" not in output(result)
+    assert "url:" not in output(result)
 
 
 def test_seed_dry_run_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,3 +393,170 @@ def test_dry_run_is_stable_across_invocations(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert first == second
+
+
+# --- an existing repo must not block `seed --dry-run` ----------------------
+
+
+@pytest.fixture
+def existing_repo_github(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """PyGithub mocked so the target repo already exists on the remote."""
+    monkeypatch.setenv(TOKEN_ENV_VAR, "t0ken")
+    github_cls = MagicMock(name="Github")
+    monkeypatch.setattr(gc, "Github", github_cls)
+
+    instance = cast(MagicMock, github_cls.return_value)
+    user = instance.get_user.return_value
+    user.login = "MonaRahmani"
+    user.get_repo.return_value = MagicMock(name="ExistingRepo")  # lookup succeeds
+    return instance
+
+
+def test_dry_run_against_an_existing_repo_exits_zero(existing_repo_github: MagicMock) -> None:
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    assert result.exit_code == 0, output(result)
+    assert "error:" not in output(result)
+
+
+def test_dry_run_against_an_existing_repo_prints_all_predicted_shas(
+    existing_repo_github: MagicMock,
+) -> None:
+    from agenteval.scenario import load_scenario
+    from agenteval.seeder import verify_deterministic
+
+    expected = verify_deterministic(load_scenario(SHIPPED_SCENARIO))
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    text = output(result)
+
+    assert result.exit_code == 0, text
+    assert shas_from_seed_output(text) == expected
+    for sha in expected:
+        assert sha in text, f"predicted SHA missing from output: {sha}"
+
+
+def test_dry_run_against_an_existing_repo_says_a_live_run_would_refuse(
+    existing_repo_github: MagicMock,
+) -> None:
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    text = output(result)
+
+    assert "already exists" in text
+    assert "would refuse" in text
+    assert "agenteval reset failing-import" in text
+
+
+def test_dry_run_against_an_existing_repo_makes_no_writes(
+    existing_repo_github: MagicMock,
+) -> None:
+    runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    existing_repo_github.get_user.return_value.create_repo.assert_not_called()
+
+
+def test_live_seed_against_an_existing_repo_still_exits_nonzero(
+    existing_repo_github: MagicMock,
+) -> None:
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO)])
+    text = output(result)
+
+    assert result.exit_code != 0
+    assert "already exists" in text
+    assert "agenteval reset failing-import" in text
+    assert "Traceback" not in text
+    existing_repo_github.get_user.return_value.create_repo.assert_not_called()
+
+
+def test_logging_survives_repeated_invocations(fake_github: MagicMock) -> None:
+    """A cached StreamHandler would write to the first invocation's stdout."""
+    first = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+    second = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"])
+
+    for result in (first, second):
+        text = output(result)
+        assert result.exit_code == 0, text
+        assert "Logging error" not in text
+        assert "would create repo" in text, "log output lost on a repeat invocation"
+
+    assert shas_from_seed_output(output(first)) == shas_from_seed_output(output(second))
+
+
+# --- dry-run output hygiene ------------------------------------------------
+
+
+def test_dry_run_summary_does_not_claim_anything_was_seeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    text = output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+
+    assert "seeded" not in text.lower()
+    assert "predicted history" in text
+    assert "nothing was written" in text
+
+
+def test_live_run_summary_still_says_seeded(fake_github: MagicMock) -> None:
+    """The live wording is unchanged; only the dry-run branch differs."""
+    user = fake_github.get_user.return_value
+    created = user.create_repo.return_value
+    created.html_url = "https://github.com/octocat/failing-import"
+    created.default_branch = "main"
+    created.create_git_blob.return_value = MagicMock(sha="blob")
+    created.create_git_tree.return_value = MagicMock(sha="tree")
+    created.create_git_commit.return_value = MagicMock(sha="c" * 40)
+
+    result = runner.invoke(app, ["seed", str(SHIPPED_SCENARIO)])
+
+    text = output(result)
+    assert result.exit_code == 0, text
+    assert "seeded failing-import" in text
+    assert "url: https://github.com/octocat/failing-import" in text
+
+
+def test_commit_messages_have_no_trailing_whitespace_in_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Messages carry a trailing newline for git; it must not reach the user."""
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+
+    text = output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+
+    assert "\\n" not in text, "a literal escaped newline leaked into output"
+    for line in text.splitlines():
+        assert line == line.rstrip(), f"trailing whitespace in: {line!r}"
+
+
+def test_dry_run_reports_each_commit_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client's line and the seeder's progress line used to duplicate."""
+    from agenteval.scenario import load_scenario
+
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    scenario = load_scenario(SHIPPED_SCENARIO)
+
+    text = output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+
+    assert "would commit" in text
+    assert not re.search(r"^commit \d+/\d+ ", text, re.M), "seeder progress line duplicates"
+
+    for commit in scenario.commits:
+        message = commit.message.strip()
+        # once in the "would commit" log, once in the final SHA summary
+        assert text.count(message) == 2, f"{message!r} reported {text.count(message)} times"
+
+
+def test_dry_run_still_prints_the_full_sha_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agenteval.scenario import load_scenario
+    from agenteval.seeder import verify_deterministic
+
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    expected = verify_deterministic(load_scenario(SHIPPED_SCENARIO))
+
+    text = output(runner.invoke(app, ["seed", str(SHIPPED_SCENARIO), "--dry-run"]))
+
+    assert "commits a live run would create:" in text
+    for sha in expected:
+        assert f"    {sha}  " in text

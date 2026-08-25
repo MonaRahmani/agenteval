@@ -717,3 +717,97 @@ def test_non_403_repo_creation_error_keeps_the_generic_message(fake_github: Magi
         make_client(fake_github).create_repo("failing-import", "desc")
 
     assert "Fine-grained" not in str(excinfo.value)
+
+
+# --- an existing repo must not block a dry run -----------------------------
+
+
+def test_dry_run_create_repo_does_not_abort_on_an_existing_repo(
+    fake_github: MagicMock,
+) -> None:
+    """A preview writes nothing, so the remote's state cannot make it unsafe."""
+    # The default fixture makes get_repo succeed, i.e. the repo already exists.
+    repo = make_client(fake_github, dry_run=True).create_repo("failing-import", "A scenario.")
+
+    assert repo.name == "failing-import"
+    fake_github.get_user.return_value.create_repo.assert_not_called()
+
+
+def test_dry_run_warns_that_a_live_run_would_refuse(
+    fake_github: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="agenteval.github_client"):
+        make_client(fake_github, dry_run=True).create_repo("failing-import", "A scenario.")
+
+    assert "already exists" in caplog.text
+    assert "would refuse" in caplog.text
+    assert "agenteval reset failing-import" in caplog.text
+
+
+def test_live_create_repo_still_aborts_on_an_existing_repo(fake_github: MagicMock) -> None:
+    with pytest.raises(GitHubClientError, match="already exists"):
+        make_client(fake_github, dry_run=False).create_repo("failing-import", "A scenario.")
+
+    fake_github.get_user.return_value.create_repo.assert_not_called()
+
+
+def test_dry_run_on_a_free_name_does_not_warn(
+    fake_github: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_github.get_user.return_value.get_repo.side_effect = UnknownObjectException(404, "x", {})
+
+    with caplog.at_level("WARNING", logger="agenteval.github_client"):
+        make_client(fake_github, dry_run=True).create_repo("failing-import", "A scenario.")
+
+    assert "already exists" not in caplog.text
+
+
+# --- message formatting in output ------------------------------------------
+
+
+def test_dry_run_commit_log_strips_the_trailing_newline(
+    fake_github: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = make_repo()
+
+    with caplog.at_level("INFO", logger="agenteval.github_client"):
+        make_client(fake_github, dry_run=True).create_commit(
+            repo, "Add package\n", {"a.py": "x\n"}, None, AUTHOR_DATE
+        )
+
+    assert "'Add package'" in caplog.text
+    assert "\\n" not in caplog.text
+
+
+def test_live_commit_log_strips_the_trailing_newline(
+    fake_github: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = make_repo()
+
+    with caplog.at_level("INFO", logger="agenteval.github_client"):
+        make_client(fake_github).create_commit(
+            repo, "Add package\n", {"a.py": "x\n"}, None, AUTHOR_DATE
+        )
+
+    assert "(Add package)" in caplog.text
+    assert "\\n" not in caplog.text
+
+
+def test_the_committed_message_keeps_its_newline(fake_github: MagicMock) -> None:
+    """Stripping is for display only — the git object must keep the newline."""
+    repo = make_repo()
+
+    make_client(fake_github).create_commit(
+        repo, "Add package\n", {"a.py": "x\n"}, None, AUTHOR_DATE
+    )
+
+    assert repo.create_git_commit.call_args.kwargs["message"] == "Add package\n"
+
+
+def test_empty_commit_error_message_is_stripped(fake_github: MagicMock) -> None:
+    repo = make_repo()
+
+    with pytest.raises(GitHubClientError) as excinfo:
+        make_client(fake_github).create_commit(repo, "Nothing\n", {}, None, AUTHOR_DATE)
+
+    assert "'Nothing'" in str(excinfo.value)
