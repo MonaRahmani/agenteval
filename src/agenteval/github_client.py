@@ -245,6 +245,7 @@ class GitHubClient:
         branch: str = DEFAULT_BRANCH,
         author_name: str = DEFAULT_AUTHOR_NAME,
         author_email: str = DEFAULT_AUTHOR_EMAIL,
+        expected_sha: str | None = None,
     ) -> str:
         """Commit `files` via the Git Data API and move `branch` to it.
 
@@ -252,8 +253,10 @@ class GitHubClient:
         hash both, so pinning only the author date would still drift per run.
 
         Args:
-            parent_sha: SHA to build on, or None for an initial commit (the ref
-                is created rather than updated).
+            parent_sha: SHA to build on, or None for an initial commit.
+            expected_sha: in dry-run mode, the SHA to report instead of a
+                placeholder. Callers that can predict the real SHA should pass
+                it so a preview shows what a live run will produce.
 
         Returns:
             The SHA of the new commit.
@@ -265,7 +268,10 @@ class GitHubClient:
         identity = InputGitAuthor(author_name, author_email, timestamp)
 
         if self.dry_run:
-            sha = self._stub_sha(message, files, parent_sha, timestamp)
+            # Prefer the caller's precomputed SHA: it is what a live run will
+            # actually produce. The placeholder is only for direct library use
+            # by a caller that has not computed one.
+            sha = expected_sha or self._stub_sha(message, files, parent_sha, timestamp)
             logger.info(
                 "[dry-run] would commit %r (%d file(s)) onto %s as %s",
                 message,

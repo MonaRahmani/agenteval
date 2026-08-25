@@ -161,11 +161,18 @@ def verify_deterministic(scenario: Scenario) -> list[str]:
 def seed(scenario: Scenario, client: GitHubClient) -> SeedResult:
     """Create the repo and replay the scenario's commits onto it.
 
+    In dry-run mode nothing is written and the reported SHAs come from
+    `verify_deterministic`, so a preview shows exactly what a live seed produces.
+
     Raises:
         GitHubClientError: repo creation or any commit failed. The message names
             the commit that failed.
     """
     repo = client.create_repo(scenario.name, scenario.description)
+
+    # A dry run must preview the SHAs a live run would produce, not placeholders.
+    # These are computed offline from git's own hashing rules.
+    predicted: list[str] | None = verify_deterministic(scenario) if client.dry_run else None
 
     shas: list[str] = []
     parent_sha: str | None = None
@@ -180,6 +187,7 @@ def seed(scenario: Scenario, client: GitHubClient) -> SeedResult:
                 cumulative,
                 parent_sha,
                 commit.author_date,
+                expected_sha=predicted[index] if predicted else None,
             )
         except GitHubClientError as exc:
             raise GitHubClientError(
