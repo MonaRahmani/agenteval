@@ -95,6 +95,7 @@ Validate a scenario. This needs no token and makes no network calls:
 $ agenteval validate scenarios/failing-import.yaml
 OK  scenarios/failing-import.yaml
   name       : failing-import
+  description: A small inventory package whose history starts healthy and later acquires a circular import between inventory.models and inventory.report, so that `import inventory` fails with a partially-initialized-module ImportError.
   rubric     : rubrics/failing-import.yaml
   files      : 6
   commits    : 4
@@ -106,16 +107,30 @@ OK  scenarios/failing-import.yaml
     44149d5c14  2026-01-12  1 changed / 6 total  Reuse report.format_currency in Item.summary
 ```
 
-Preview a seed. Also needs no token, because a dry run writes nothing:
+Preview a seed. This needs no token either, because a dry run writes nothing — and it is
+not blocked by the target repo already existing, though it says so:
 
 ```console
 $ agenteval seed scenarios/failing-import.yaml --dry-run
-[dry-run] no GITHUB_TOKEN set; running unauthenticated - no API calls will be made
 dry run: no writes will be made
 [dry-run] would create repo 'failing-import' with topic 'agenteval-managed'
-commit 1/4 6b7b45e Add inventory package with Item model and Store
-...
+[dry-run] would commit 'Add inventory package with Item model and Store' (4 file(s)) onto <no parent> as 6b7b45e2f152cea66a6b427cc2785a2fa9893eba
+[dry-run] would commit 'Add tests covering Store totals and duplicate SKUs' (5 file(s)) onto 6b7b45e2f152cea66a6b427cc2785a2fa9893eba as 446cc36cfa7aa16f5898c73e6357c199d7532c6b
+[dry-run] would commit 'Add report module for formatted stock listings' (6 file(s)) onto 446cc36cfa7aa16f5898c73e6357c199d7532c6b as 7abd477d0de1a652424b7309b2958004dddfe0c6
+[dry-run] would commit 'Reuse report.format_currency in Item.summary' (6 file(s)) onto 7abd477d0de1a652424b7309b2958004dddfe0c6 as 44149d5c143d23c7276c75aed2a295f9e95a5f84
+[dry-run] would force main to 44149d5c143d23c7276c75aed2a295f9e95a5f84
+
+predicted history for failing-import (dry run: nothing was written)
+  commits a live run would create:
+    6b7b45e2f152cea66a6b427cc2785a2fa9893eba  Add inventory package with Item model and Store
+    446cc36cfa7aa16f5898c73e6357c199d7532c6b  Add tests covering Store totals and duplicate SKUs
+    7abd477d0de1a652424b7309b2958004dddfe0c6  Add report module for formatted stock listings
+    44149d5c143d23c7276c75aed2a295f9e95a5f84  Reuse report.format_currency in Item.summary
 ```
+
+Without `GITHUB_TOKEN` set, the run prints two extra lines up front: that it is running
+unauthenticated, and that it is assuming the repo does not exist because it has no
+credentials to check with. The predicted SHAs are identical either way.
 
 The SHAs a dry run reports are the ones a live seed will actually produce — the same
 values `validate` predicts, computed the same way. A preview that disagreed with the
@@ -166,7 +181,7 @@ content of the files it touches, as of that commit**:
 name: failing-import              # must be a valid GitHub repo name
 description: A package that acquires a circular import partway through its history.
 seeded_bug: >-                    # what the agent is expected to find
-  Commit 3 adds report.py importing models.py. Commit 4 then makes models.py
+  Commit 1 adds report.py importing models.py. Commit 2 then makes models.py
   import report.py at module scope, closing the cycle.
 rubric: rubrics/failing-import.yaml
 
@@ -204,7 +219,7 @@ commits:
 
 Content is declared **per commit, not once globally**. That is what makes progressive
 history possible: `inventory/models.py` appears in commit 0 as working code and again in
-commit 3 with the bug, so the repository has a genuine before and after rather than a
+commit 2 with the bug, so the repository has a genuine before and after rather than a
 history where every commit already contains the final state.
 
 The schema enforces the rules that make a scenario seedable and reproducible:
@@ -252,7 +267,7 @@ construction; bumps are deliberate and reviewable.
 ## Development
 
 ```bash
-pytest                                              # 167 tests
+pytest                                              # 199 tests
 pytest --cov=agenteval --cov-fail-under=85          # coverage floor is 85%
 ruff check .                                        # lint
 ruff format --check .                               # formatting
