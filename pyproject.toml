@@ -18,11 +18,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Pinned to exact versions on purpose. ruff's formatter and mypy's inference both
+# change between releases, so an unpinned range lets CI install a newer version
+# than a developer has locally. The result is a CI failure — a reformatted file
+# or a new type error — that cannot be reproduced on the machine that has to fix
+# it. Bump these deliberately, in their own commit, so the diff is reviewable.
 dev = [
-    "pytest",
-    "pytest-cov",
-    "ruff",
-    "mypy",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.4",
+    "mypy==2.3.1",
     "types-PyYAML",
 ]
 
